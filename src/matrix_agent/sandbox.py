@@ -184,7 +184,13 @@ class SandboxManager:
             env_flags += ["-e", f"GEMINI_MODEL={self.settings.gemini_model}"]
         if self.settings.dashscope_api_key:
             env_flags += ["-e", f"DASHSCOPE_API_KEY={self.settings.dashscope_api_key}"]
-        if self.settings.github_token:
+        if getattr(self.settings, "forge_token", ""):
+            env_flags += ["-e", f"FORGE_TOKEN={self.settings.forge_token}"]
+        if getattr(self.settings, "forge_api_base", ""):
+            env_flags += ["-e", f"FORGE_API_BASE={self.settings.forge_api_base}"]
+        if getattr(self.settings, "forge_web_url", ""):
+            env_flags += ["-e", f"FORGE_WEB_URL={self.settings.forge_web_url}"]
+        if getattr(self.settings, "github_token", ""):
             env_flags += ["-e", f"GITHUB_TOKEN={self.settings.github_token}"]
 
         rc, out, err = await self._run(
@@ -244,9 +250,17 @@ class SandboxManager:
         script_parts.append('git config --global user.email "bot@matrix-agent"')
         script_parts.append('git config --global user.name "Matrix Agent"')
 
-        # gh CLI auth
-        if self.settings.github_token:
+        # git auth
+        if getattr(self.settings, "forge_type", "github") == "github" and getattr(self.settings, "forge_token", ""):
             script_parts.append("gh auth setup-git")
+        elif getattr(self.settings, "forge_token", "") and getattr(self.settings, "forge_web_url", ""):
+            forge_host = self.settings.forge_web_url.replace("https://", "").replace("http://", "").rstrip("/")
+            script_parts.append("git config --global credential.helper store")
+            script_parts.append(
+                "cat >> ~/.git-credentials <<'EOF'\n"
+                f"https://{self.settings.forge_token}@{forge_host}\n"
+                "EOF"
+            )
 
         script = "\n".join(script_parts)
         rc, out, err = await self._run(

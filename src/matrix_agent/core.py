@@ -7,14 +7,16 @@ import time
 from .sandbox import SandboxManager
 from .decider import Decider
 from .channels import ChannelAdapter
+from .forge import ForgeClient
 
 logger = logging.getLogger(__name__)
 
 
 class TaskRunner:
-    def __init__(self, decider: Decider, sandbox: SandboxManager):
+    def __init__(self, decider: Decider, sandbox: SandboxManager, forge: ForgeClient | None = None):
         self.decider = decider
         self.sandbox = sandbox
+        self.forge = forge
         self._queues: dict[str, asyncio.Queue] = {}
         self._workers: dict[str, asyncio.Task] = {}
         self._channels: dict[str, ChannelAdapter] = {}  # task_id -> channel
@@ -130,15 +132,18 @@ class TaskRunner:
             return
 
         repo_full = repo_match.group(1)  # e.g. "owner/repo"
+        if self.forge:
+            self.forge.repo = repo_full
         repo_name = repo_full.split("/")[-1]  # e.g. "repo"
         repo_path = f"/workspace/{repo_name}"
         mode = "CI fix" if is_ci_fix else "new issue"
         logger.info("[%s] GitHub pipeline: %s for %s", task_id[:20], mode, repo_full)
 
         # Clone repo (idempotent — skip if dir exists)
+        forge_web = getattr(self.sandbox.settings, "forge_web_url", "https://github.com").rstrip("/") or "https://github.com"
         clone_rc, _, clone_err = await self.sandbox.exec(
             task_id,
-            f"test -d {repo_path}/.git || git clone https://github.com/{repo_full} {repo_path}",
+            f"test -d {repo_path}/.git || git clone {forge_web}/{repo_full} {repo_path}",
         )
         if clone_rc != 0:
             await channel.deliver_error(task_id, f"Clone failed: {clone_err}")
@@ -229,10 +234,13 @@ class TaskRunner:
     async def _host_push(
         self, task_id: str, repo_path: str, repo_full: str, is_ci_fix: bool,
     ) -> tuple[str | None, str | None]:
-        """Host-controlled push: push branch, create PR.
+        """Host-controlled push: push branch, create or fetch PR.
 
         Returns (pr_url, error_reason). error_reason is None on success.
         """
+        if not self.forge:
+            return None, "Forge client not configured"
+
         # 1. Detect branch
         rc, branch_out, _ = await self.sandbox.exec(
             task_id, f"cd {repo_path} && git rev-parse --abbrev-ref HEAD",
@@ -247,44 +255,30 @@ class TaskRunner:
             )
 
         # 2. Push
-        if is_ci_fix:
-            push_cmd = f"cd {repo_path} && git push --force origin {branch}"
-        else:
-            push_cmd = f"cd {repo_path} && git push -u origin {branch}"
+        push_cmd = f"cd {repo_path} && git push {'--force' if is_ci_fix else '-u'} origin {branch}"
         rc, _, push_err = await self.sandbox.exec(task_id, push_cmd)
         if rc != 0:
             logger.error("[%s] Push failed: %s", task_id[:20], push_err)
             return None, f"git push failed: {push_err.strip()}"
 
-        # 3. Create PR (or get existing PR URL for CI fixes)
-        if is_ci_fix:
-            rc, pr_url_out, _ = await self.sandbox.exec(
-                task_id,
-                f"cd {repo_path} && gh pr view {branch} --json url -q .url",
-            )
-        else:
-            issue_num = task_id.replace("gh-", "").split("-")[0]
-            rc, pr_url_out, _ = await self.sandbox.exec(
-                task_id,
-                f"cd {repo_path} && "
-                f"gh pr create --title 'Fix #{issue_num}' "
-                f"--body 'Closes #{issue_num}' --head {branch} 2>&1 || "
-                f"gh pr view {branch} --json url -q .url",
-            )
-        # Extract first URL from output (gh pr create may include extra text)
-        pr_url = None
-        for line in pr_url_out.splitlines():
-            line = line.strip()
-            if line.startswith("http"):
-                pr_url = line
-                break
-        if not pr_url:
-            logger.error("[%s] Failed to get PR URL: %s", task_id[:20], pr_url_out)
-            return None, f"Failed to create PR: {pr_url_out.strip()}"
+        # 3. Fetch existing PR by head
+        pr_url = await self.forge.get_pr_url_by_head(branch)
 
-        # 4. Write PR URL to IPC
+        # 4. Create PR if none exists (non-CI only)
+        if not pr_url and not is_ci_fix:
+            issue_num = task_id.replace("gh-", "").split("-")[0]
+            base_branch = self.sandbox.settings.forge_default_branch or "main"
+            title = f"Fix #{issue_num}"
+            body = f"Closes #{issue_num}"
+            pr_url = await self.forge.create_pr(head=branch, base=base_branch, title=title, body=body)
+
+        if not pr_url:
+            logger.error("[%s] Failed to get PR URL for %s", task_id[:20], branch)
+            return None, "Failed to create or find PR"
+
+        # 5. Write PR URL to IPC
         self.sandbox.write_ipc_file(task_id, "pr-url.txt", pr_url)
-        logger.info("[%s] Host pushed %s and created PR: %s", task_id[:20], branch, pr_url)
+        logger.info("[%s] Host pushed %s and recorded PR: %s", task_id[:20], branch, pr_url)
         return pr_url, None
 
     async def reconcile(self) -> None:

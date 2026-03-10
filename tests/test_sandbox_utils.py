@@ -1,6 +1,8 @@
 """Unit tests for sandbox utility functions."""
 
-from matrix_agent.sandbox import _container_name
+import pytest
+
+from matrix_agent.sandbox import SandboxManager, _container_name
 
 
 def test_container_name_alphanumeric():
@@ -36,3 +38,43 @@ def test_container_name_long():
     """Test with long input."""
     long_id = "a" * 100
     assert _container_name(long_id) == f"sandbox-{long_id}"
+
+
+@pytest.mark.asyncio
+async def test_create_exports_forge_env(settings):
+    settings.forge_token = "tok"
+    settings.forge_api_base = "https://forge/api/v1"
+    settings.forge_web_url = "https://forge"
+    sm = SandboxManager(settings)
+    calls = []
+
+    async def fake_run(*args, **kwargs):
+        calls.append(args)
+        return (0, "", "")
+
+    sm._run = fake_run
+    await sm.create("room1")
+
+    run_args = " ".join(" ".join(map(str, c)) for c in calls if c)
+    assert "FORGE_TOKEN=tok" in run_args
+    assert "FORGE_API_BASE=https://forge/api/v1" in run_args
+    assert "FORGE_WEB_URL=https://forge" in run_args
+
+
+@pytest.mark.asyncio
+async def test_non_github_writes_git_credentials(settings):
+    settings.forge_type = "gitea"
+    settings.forge_token = "secrettok"
+    settings.forge_web_url = "https://forge.example"
+    sm = SandboxManager(settings)
+    calls = []
+
+    async def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return (0, "", "")
+
+    sm._run = fake_run
+    await sm.create("room2")
+
+    scripts = [kw.get("stdin_data", b"").decode() for _, kw in calls if "stdin_data" in kw]
+    assert any("git-credentials" in s and "forge.example" in s for s in scripts)

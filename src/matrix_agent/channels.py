@@ -1,13 +1,12 @@
-"""Channel adapters — ingest tasks from external sources (GitHub, etc.)."""
+"""Channel adapters — ingest tasks from external sources (forge webhooks, etc.)."""
 
-import hashlib
-import hmac
 import json
 import logging
-import asyncio
 from abc import ABC, abstractmethod
 
 from aiohttp import web
+
+from .forge import ForgeClient, IssueEvent
 
 log = logging.getLogger(__name__)
 
@@ -38,275 +37,107 @@ class ChannelAdapter(ABC):
         return []
 
 
-class GitHubChannel(ChannelAdapter):
-    system_prompt = ""  # GitHub path bypasses Decider; system_prompt unused
+class ForgeChannel(ChannelAdapter):
+    system_prompt = ""
 
-    def __init__(self, task_runner, settings):
+    def __init__(self, task_runner, settings, forge_client: ForgeClient):
         self.task_runner = task_runner
         self.settings = settings
+        self.forge = forge_client
         self._runner: web.AppRunner | None = None
 
+    # --------------------------- Lifecycle --------------------------- #
     def _make_app(self) -> web.Application:
         app = web.Application()
-        app.router.add_post("/webhook/github", self._handle_webhook)
+        path = f"/webhook/{getattr(self.settings, 'forge_type', 'github')}"
+        app.router.add_post(path, self._handle_webhook)
         return app
 
     async def start(self) -> None:
         app = self._make_app()
         self._runner = web.AppRunner(app)
         await self._runner.setup()
-        site = web.TCPSite(self._runner, "0.0.0.0", self.settings.github_webhook_port)
+        port = getattr(self.settings, "github_webhook_port", 0)
+        site = web.TCPSite(self._runner, "0.0.0.0", port)
         await site.start()
-        log.info("GitHub webhook listening on port %s", self.settings.github_webhook_port)
+        log.info("Forge webhook listening on port %s", port)
 
     async def stop(self) -> None:
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
 
-    async def send_update(self, task_id: str, text: str) -> None:
-        # No-op for GitHub — avoid spamming issues with intermediate output
-        pass
-
-    async def deliver_result(self, task_id: str, text: str, *, status: str = "completed") -> None:
-        issue_number = task_id.split("-", 1)[1]
-        if status == "max_turns":
-            body = f"🤖 {text}"
-        else:
-            body = f"✅ Completed — {text}"
-
-        proc = await asyncio.create_subprocess_exec(
-            "gh", "issue", "comment", issue_number,
-            "--repo", self.settings.github_repo,
-            "--body", body,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            log.error("gh issue comment failed for #%s: %s", issue_number, stderr.decode())
-            return
-
-        # Only close the issue on successful completion
-        if status != "max_turns":
-            proc = await asyncio.create_subprocess_exec(
-                "gh", "issue", "close", issue_number,
-                "--repo", self.settings.github_repo,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                log.error("gh issue close failed for #%s: %s", issue_number, stderr.decode())
-
-    async def deliver_error(self, task_id: str, error: str) -> None:
-        issue_number = task_id.split("-", 1)[1]
-        body = f"❌ Failed: {error}"
-        proc = await asyncio.create_subprocess_exec(
-            "gh", "issue", "comment", issue_number,
-            "--repo", self.settings.github_repo,
-            "--body", body,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            log.error("gh issue comment (error) failed for #%s: %s", issue_number, stderr.decode())
-            return
-
-        # Close the issue on failure so it's not retried on restart
-        proc = await asyncio.create_subprocess_exec(
-            "gh", "issue", "close", issue_number,
-            "--repo", self.settings.github_repo,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            log.error("gh issue close failed for #%s: %s", issue_number, stderr.decode())
-
-    async def is_valid(self, task_id: str) -> bool:
-        """Check if the issue is still open with the agent-task label."""
-        issue_number = task_id.split("-", 1)[1]
-        proc = await asyncio.create_subprocess_exec(
-            "gh", "issue", "view", issue_number,
-            "--repo", self.settings.github_repo,
-            "--json", "state,labels",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-        if proc.returncode != 0:
-            return False
-        data = json.loads(stdout)
-        if data.get("state") != "OPEN":
-            return False
-        labels = [lb["name"] for lb in data.get("labels", [])]
-        return "agent-task" in labels
-
-    async def recover_tasks(self) -> list[tuple[str, str]]:
-        """Scan for open agent-task issues to resume after restart."""
-        repo = self.settings.github_repo
-        if not repo:
-            log.warning("github_repo not set — skipping crash recovery for GitHub tasks")
-            return []
-
-        proc = await asyncio.create_subprocess_exec(
-            "gh", "issue", "list",
-            "--repo", repo,
-            "--label", "agent-task",
-            "--state", "open",
-            "--json", "number,title,body",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            log.error("gh issue list failed: %s", stderr.decode())
-            return []
-
-        issues = json.loads(stdout)
-        results = []
-        for issue in issues:
-            number = issue["number"]
-            task_id = f"gh-{number}"
-            message = f"Repository: {repo}\n\n# {issue['title']}\n\n{issue.get('body', '')}"
-            results.append((task_id, message))
-
-            # Post recovery comment
-            proc = await asyncio.create_subprocess_exec(
-                "gh", "issue", "comment", str(number),
-                "--repo", repo,
-                "--body", "🤖 Bot restarted — resuming work on this issue.",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                log.error("gh issue comment (recovery) failed for #%s: %s", number, stderr.decode())
-
-        log.info("GitHub recovery: found %d open agent-task issues", len(results))
-        return results
-
+    # --------------------------- Webhook handling --------------------------- #
     async def _handle_webhook(self, request: web.Request) -> web.Response:
         body = await request.read()
-        secret = self.settings.github_webhook_secret
+        if not self.forge.verify_webhook(request.headers, body):
+            return web.Response(status=401, text="Invalid signature")
 
-        if secret:
-            sig_header = request.headers.get("X-Hub-Signature-256", "")
-            if not sig_header:
-                return web.Response(status=401, text="Missing signature")
-            expected = "sha256=" + hmac.new(
-                secret.encode(), body, hashlib.sha256
-            ).hexdigest()
-            if not hmac.compare_digest(sig_header, expected):
-                return web.Response(status=401, text="Invalid signature")
-
-        payload = json.loads(body)
-        event_type = request.headers.get("X-GitHub-Event", "")
+        payload = json.loads(body or b"{}")
+        event_type = request.headers.get("X-GitHub-Event") or request.headers.get("X-Gitea-Event", "")
         action = payload.get("action", "")
+        issue_event = self.forge.parse_issue_event(payload, event_type, action)
+        if not issue_event:
+            return web.Response(text="ignored")
+
+        task_id = issue_event.task_id
 
         if event_type == "issues" and action in ("labeled", "reopened"):
-            # For "labeled", only react to the agent-task label
-            if action == "labeled":
-                label = payload.get("label", {}).get("name", "")
-                if label != "agent-task":
-                    return web.Response(text="ignored label")
-            else:
-                # For "reopened", verify agent-task label is present
-                issue_labels = [lb["name"] for lb in payload["issue"].get("labels", [])]
-                if "agent-task" not in issue_labels:
-                    return web.Response(text="reopened but not an agent-task issue")
-
-            issue = payload["issue"]
-            task_id = f"gh-{issue['number']}"
-
-            # Idempotency: skip if already processing
-            if task_id in self.task_runner._processing:
+            if task_id in getattr(self.task_runner, "_processing", set()):
                 return web.Response(text="already processing")
-
-            # Post "Working" comment
-            proc = await asyncio.create_subprocess_exec(
-                "gh", "issue", "comment", str(issue["number"]),
-                "--repo", self.settings.github_repo,
-                "--body", "🤖 Working on this issue...",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                log.error("gh issue comment (working) failed for #%s: %s", issue["number"], stderr.decode())
-
-            repo_full_name = payload.get("repository", {}).get("full_name", "")
-
-            # Fetch comments once for both CI context check and backfill
-            all_comment_bodies: list[str] = []
-            if repo_full_name:
-                proc = await asyncio.create_subprocess_exec(
-                    "gh", "api", f"repos/{repo_full_name}/issues/{issue['number']}/comments",
-                    "--jq", "[.[] | .body]",
-                    stdout=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await proc.communicate()
-                if proc.returncode == 0 and stdout:
-                    try:
-                        all_comment_bodies = json.loads(stdout.decode())
-                    except (ValueError, TypeError):
-                        all_comment_bodies = []
-
-            # For reopened issues, check for CI failure context
-            ci_context = None
-            if action == "reopened" and all_comment_bodies:
-                ci_comments = [b for b in all_comment_bodies if b.strip().startswith("\u26a0\ufe0f")]
-                if ci_comments:
-                    ci_context = ci_comments[-1]  # most recent CI failure
-
-            # Build and enqueue the message
-            if ci_context:
-                message = f"CI_FIX: {ci_context}\n\nRepository: {repo_full_name}\n\n# {issue['title']}\n\n{issue.get('body', '')}"
-                await self.task_runner.enqueue(task_id, message, self)
-                # Skip backfill — CI context is already included
-            else:
-                message = f"Repository: {repo_full_name}\n\n# {issue['title']}\n\n{issue.get('body', '')}"
-                await self.task_runner.enqueue(task_id, message, self)
-
-                # Backfill existing comments (reuse already-fetched data)
-                if all_comment_bodies:
-                    comments = [
-                        b for b in all_comment_bodies
-                        if b.strip() and not b.strip().startswith(("\U0001f916", "\u2705", "\u274c"))
-                    ]
-                    if comments:
-                        context = "Previous comments on this issue:\n\n" + "\n---\n".join(comments)
-                        await self.task_runner.enqueue(task_id, context, self)
-
+            await self.forge.comment_issue(issue_event.issue_number, "🤖 Working on this issue...")
+            await self.task_runner.enqueue(task_id, issue_event.message, self)
+            if issue_event.ci_context:
+                await self.task_runner.enqueue(task_id, issue_event.ci_context, self)
         elif event_type == "issue_comment" and action == "created":
-            issue = payload["issue"]
-            labels = [lb["name"] for lb in issue.get("labels", [])]
-            if "agent-task" not in labels:
-                return web.Response(text="not an agent-task issue")
-
-            # Ignore bot's own comments to prevent feedback loops
-            sender = payload.get("comment", {}).get("user", {}).get("login", "")
-            if sender.endswith("[bot]") or payload["comment"]["body"].startswith(("✅", "❌", "🤖")):
-                return web.Response(text="ignoring bot comment")
-
-            task_id = f"gh-{issue['number']}"
-
-            # Post "Working" comment if this is a new task (not already processing)
-            if task_id not in self.task_runner._processing:
-                proc = await asyncio.create_subprocess_exec(
-                    "gh", "issue", "comment", str(issue["number"]),
-                    "--repo", self.settings.github_repo,
-                    "--body", "🤖 Working on this issue...",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, stderr = await proc.communicate()
-                if proc.returncode != 0:
-                    log.error("gh issue comment (working) failed for #%s: %s", issue["number"], stderr.decode())
-
-            comment_body = payload["comment"]["body"]
-            await self.task_runner.enqueue(task_id, comment_body, self)
+            comment_body = payload.get("comment", {}).get("body", "")
+            if comment_body:
+                await self.task_runner.enqueue(task_id, comment_body, self)
+        else:
+            return web.Response(text="ignored")
 
         return web.Response(status=202, text="Accepted")
+
+    # --------------------------- Deliveries --------------------------- #
+    async def send_update(self, task_id: str, text: str) -> None:
+        # No-op to avoid spamming issues
+        return None
+
+    async def deliver_result(self, task_id: str, text: str, *, status: str = "completed") -> None:
+        issue_number = int(task_id.split("-", 1)[1])
+        if status == "max_turns":
+            await self.forge.comment_issue(issue_number, f"🤖 {text}")
+            return
+        await self.forge.comment_issue(issue_number, f"✅ Completed — {text}")
+        await self.forge.close_issue(issue_number)
+
+    async def deliver_error(self, task_id: str, error: str) -> None:
+        issue_number = int(task_id.split("-", 1)[1])
+        await self.forge.comment_issue(issue_number, f"❌ Failed: {error}")
+        await self.forge.close_issue(issue_number)
+
+    async def is_valid(self, task_id: str) -> bool:
+        issue_number = int(task_id.split("-", 1)[1])
+        return await self.forge.is_issue_open_with_label(issue_number, getattr(self.settings, "agent_label", "agent-task"))
+
+    async def recover_tasks(self) -> list[tuple[str, str]]:
+        repo = getattr(self.settings, "forge_repo", "")
+        results: list[tuple[str, str]] = []
+        issues = await self.forge.list_open_agent_issues()
+        for issue in issues:
+            number = issue.get("number")
+            if not number:
+                continue
+            task_id = f"gh-{number}"
+            title = issue.get("title", "")
+            body = issue.get("body", "")
+            message = f"Repository: {repo}\n\n# {title}\n\n{body}"
+            results.append((task_id, message))
+            await self.task_runner.enqueue(task_id, message, self)
+            await self.forge.comment_issue(number, "🤖 Bot restarted — resuming work on this issue.")
+        log.info("Forge recovery: found %d open issues", len(results))
+        return results
+
+
+# Backward compatibility
+GitHubChannel = ForgeChannel

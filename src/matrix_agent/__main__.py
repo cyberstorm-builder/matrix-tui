@@ -10,7 +10,8 @@ from .sandbox import SandboxManager
 from .decider import Decider
 from .core import TaskRunner
 from .bot import Bot
-from .channels import GitHubChannel
+from .channels import ForgeChannel
+from .forge import ForgeClient
 
 logging.basicConfig(
     level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
@@ -22,20 +23,21 @@ async def main():
     settings = Settings()
     sandbox = SandboxManager(settings)
     decider = Decider(settings, sandbox)
-    task_runner = TaskRunner(decider, sandbox)
+    task_runner = TaskRunner(decider, sandbox, forge_client=forge_client)
 
     # Load persisted state and restore histories
     histories = await sandbox.load_state()
     decider.load_histories(histories)
 
-    # GitHub recovery: scan for open issues before starting webhook server
-    github_channel = None
-    if settings.forge_type == "github" and settings.github_token:
-        github_channel = GitHubChannel(task_runner=task_runner, settings=settings)
-        recovered = await github_channel.recover_tasks()
-        await github_channel.start()
+    # Forge recovery: scan for open issues before starting webhook server
+    forge_channel = None
+    forge_client = ForgeClient.from_settings(settings)
+    if settings.forge_token:
+        forge_channel = ForgeChannel(task_runner=task_runner, settings=settings, forge_client=forge_client)
+        recovered = await forge_channel.recover_tasks()
+        await forge_channel.start()
         for task_id, msg in recovered:
-            await task_runner.enqueue(task_id, msg, github_channel)
+            await task_runner.enqueue(task_id, msg, forge_channel)
 
     # Matrix recovery: sync + pre_register surviving rooms
     bot = Bot(settings, sandbox, decider, task_runner)
@@ -70,8 +72,8 @@ async def main():
 
         await task_runner.shutdown()
         sandbox.save_state()
-        if github_channel:
-            await github_channel.stop()
+        if forge_channel:
+            await forge_channel.stop()
         logging.info("Shutdown complete")
 
 
