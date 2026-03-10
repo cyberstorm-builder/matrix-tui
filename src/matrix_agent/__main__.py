@@ -30,7 +30,7 @@ async def main():
 
     # GitHub recovery: scan for open issues before starting webhook server
     github_channel = None
-    if settings.github_token:
+    if settings.forge_type == "github" and settings.github_token:
         github_channel = GitHubChannel(task_runner=task_runner, settings=settings)
         recovered = await github_channel.recover_tasks()
         await github_channel.start()
