@@ -68,3 +68,45 @@ def test_derive_from_vps_ip_partial_overwrite():
     )
     assert settings.matrix_homeserver == custom_hs
     assert settings.matrix_user == f"@matrixbot:{vps_ip}"
+
+def test_headless_defaults():
+    settings = Settings(
+        matrix_password="pass",
+        llm_api_key="key",
+    )
+
+    assert settings.headless_mode == "matrix"
+    assert settings.headless_default_workflow is None
+    assert settings.redis_url == "redis://localhost:6379/0"
+    assert settings.redis_jobs_key == "matrix-tui:jobs"
+    assert settings.redis_results_prefix == "matrix-tui:results:"
+    assert settings.redis_results_list == "matrix-tui:results:list"
+    assert settings.redis_result_ttl_seconds == 86400
+    assert settings.headless_timeout_seconds == settings.coding_timeout_seconds
+    assert settings.headless_progress_enabled is False
+
+
+def test_headless_overrides():
+    settings = Settings(
+        matrix_password="pass",
+        llm_api_key="key",
+        headless_mode="queue",
+        headless_default_workflow="wf",
+        redis_url="redis://redis:6380/1",
+        redis_jobs_key="jobs:list",
+        redis_results_prefix="results:list:",
+        redis_results_list="results:list:queue",
+        redis_result_ttl_seconds=3600,
+        headless_timeout_seconds=120,
+        headless_progress_enabled=True,
+    )
+
+    assert settings.headless_mode == "queue"
+    assert settings.headless_default_workflow == "wf"
+    assert settings.redis_url == "redis://redis:6380/1"
+    assert settings.redis_jobs_key == "jobs:list"
+    assert settings.redis_results_prefix == "results:list:"
+    assert settings.redis_results_list == "results:list:queue"
+    assert settings.redis_result_ttl_seconds == 3600
+    assert settings.headless_timeout_seconds == 120
+    assert settings.headless_progress_enabled is True

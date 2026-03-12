@@ -19,6 +19,9 @@ class Settings(BaseSettings):
                 self.matrix_user = f"@matrixbot:{self.vps_ip}"
         elif not self.matrix_homeserver:
             self.matrix_homeserver = "https://matrix.org"
+
+        if self.headless_timeout_seconds is None:
+            self.headless_timeout_seconds = self.coding_timeout_seconds
         return self
     llm_api_key: str
     llm_api_base: str = ""
@@ -37,3 +40,13 @@ class Settings(BaseSettings):
     github_webhook_port: int = 8090
     github_webhook_secret: str = ""
     ipc_base_dir: str = "/tmp/sandbox-ipc"
+    # Headless / Redis
+    headless_mode: str = "matrix"
+    headless_default_workflow: str | None = None
+    redis_url: str = "redis://localhost:6379/0"
+    redis_jobs_key: str = "matrix-tui:jobs"
+    redis_results_prefix: str = "matrix-tui:results:"
+    redis_results_list: str = "matrix-tui:results:list"
+    redis_result_ttl_seconds: int = 86400
+    headless_timeout_seconds: int | None = None
+    headless_progress_enabled: bool = False
