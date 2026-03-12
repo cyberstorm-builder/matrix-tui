@@ -360,6 +360,17 @@ some VPS IPs. Use the local Synapse setup instead (`setup-synapse.sh`).
 **Command timeout errors** Increase `COMMAND_TIMEOUT_SECONDS` in `.env` for slow
 operations like `npm install`.
 
+## Headless / Queue mode
+
+Matrix/GitHub behaviour remains the default. To run without Matrix:
+
+- **One-shot CLI:** `python -m matrix_agent --mode headless --workflow <name> --payload-json '<json>' [--correlation-id <id>] [--redis-url redis://localhost:6379/0] [--results-prefix matrix-tui:results:] [--progress]`
+- **Redis worker:** `python -m matrix_agent --mode queue --redis-url redis://localhost:6379/0 --jobs-key matrix-tui:jobs --results-prefix matrix-tui:results: [--result-ttl-seconds 86400] [--timeout-seconds 900]`
+- **Job schema (Redis list):** `{ "workflow": "<name>", "payload": {..}|"<text>", "correlation_id": "<id optional>", "reply_to": "<results prefix optional>", "timeout_seconds": <int optional> }`
+- **Results:** JSON stored at `<results_prefix><correlation_id>` with 24h TTL, and appended to `<results_prefix>list`. Status values: `completed`, `failed`, `timeout` (plus `progress` entries when enabled). Text-only output.
+
+See `docs/headless.md` for full usage and schema details.
+
 ## Development
 
 ```bash
